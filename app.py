@@ -1,9 +1,13 @@
-# app.py — DeepSeek-first bridge with explicit 402 handling and optional OpenAI fallback.
+# app.py — Keyless bridge to OllamaFreeAPI (OpenAI-compatible /chat/completions)
 # Contract:
-#   POST /v1/chat  Headers: X-Shared-Secret: <secret>
-#                  Body:    {"prompt":"..."}
+#   POST /v1/chat   Headers: X-Shared-Secret: <secret>
+#                   Body:    {"prompt":"..."}
 #   200 {"ok":true,"reply":"..."} | 200 {"ok":false,"error":"<reason>"}
 #   401 for bad secret; 400 for missing_prompt
+#
+# Notes:
+# - No API key needed. Public gateway. Expect occasional rate limits/overload.
+# - Configure one or two bases via env (OLLAMA_BASE, OLLAMA_ALT_BASE).
 
 import os, time, asyncio, logging, uuid, random
 from typing import Optional, Tuple
@@ -14,25 +18,20 @@ from pydantic import BaseModel
 # ========= ENV =========
 SHARED_SECRET        = os.getenv("SHARED_SECRET", "")
 
-# Primary: DeepSeek
-DEEPSEEK_API_KEY     = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE        = os.getenv("DEEPSEEK_BASE", "https://api.deepseek.com")
-DEEPSEEK_PATH        = os.getenv("DEEPSEEK_PATH", "/v1/chat/completions")  # alt: "/chat/completions"
-DEEPSEEK_MODEL       = os.getenv("MODEL_NAME", "deepseek-chat")
+# Primary public gateway (no auth)
+OLLAMA_BASE          = os.getenv("OLLAMA_BASE", "https://ollamafreeapi.onrender.com")
+OLLAMA_ALT_BASE      = os.getenv("OLLAMA_ALT_BASE", "")  # optional second base
+OLLAMA_PATH          = os.getenv("OLLAMA_PATH", "/chat/completions")
 
-# Optional fallback: OpenAI
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL         = os.getenv("OPENAI_MODEL", "gpt-3.5-turbo")
-
-# Timeouts / retries
-ATTEMPT_TIMEOUT_S    = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "6.0"))
-REQ_TIMEOUT_S        = float(os.getenv("REQ_TIMEOUT_SECS", "30"))
-MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "2"))
-RETRY_BACKOFF_S      = float(os.getenv("RETRY_BACKOFF_SECS", "1.0"))
-
-# Generation
+MODEL_NAME           = os.getenv("MODEL_NAME", "llama3-8b")  # pick a lightweight default
 TEMP                 = float(os.getenv("TEMP", "0.6"))
 MAX_TOKENS           = int(os.getenv("MAX_TOKENS", "160"))
+
+# Timeouts / retries
+ATTEMPT_TIMEOUT_S    = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "6.0"))   # per HTTP attempt
+REQ_TIMEOUT_S        = float(os.getenv("REQ_TIMEOUT_SECS", "25"))        # total request budget
+MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "2"))                # per-endpoint attempts
+RETRY_BACKOFF_S      = float(os.getenv("RETRY_BACKOFF_SECS", "0.8"))     # base backoff
 
 # Server
 HOST                 = os.getenv("HOST", "0.0.0.0")
@@ -66,21 +65,18 @@ def clamp_text(s: str, n: int = 380) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 def reason_from_status_and_body(status: int, body: Optional[dict]) -> str:
-    # Map known hard failures
-    if status in (401,):
+    if status == 401:
         return "auth"
-    if status in (402,):  # Payment Required / quota depleted at provider
-        return "quota"
-    # Inspect body for hints
-    if body and isinstance(body, dict):
-        err = body.get("error") or {}
-        msg = (err.get("message") or "") if isinstance(err, dict) else ""
-        code = (err.get("code") or "") if isinstance(err, dict) else ""
-        low = f"{msg} {code}".lower()
-        if "insufficient_quota" in low or "quota" in low or "payment" in low:
-            return "quota"
-        if "timeout" in low:
-            return "timeout"
+    if status == 404:
+        return "http_404"
+    if status == 405:
+        return "http_405"
+    if status == 429:
+        return "rate"
+    if status in (500, 502, 503, 504):
+        return "upstream"
+    if status == 0:
+        return "net"
     return f"http_{status}"
 
 async def _attempt_post(url: str, headers: dict, json: dict, timeout_s: float) -> Tuple[int, Optional[dict]]:
@@ -93,13 +89,14 @@ async def _attempt_post(url: str, headers: dict, json: dict, timeout_s: float) -
         body = None
     return r.status_code, body
 
-async def call_deepseek(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, int]:
-    if not DEEPSEEK_API_KEY:
-        return False, "", "missing_key", 0
-
-    headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
+async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, int]:
+    """
+    Returns: (ok, reply, reason, http_status)
+    reason in {"timeout","net","rate","upstream","http_###","parse","empty"}
+    """
+    headers = {"Content-Type": "application/json"}  # no auth for public gateway
     body = {
-        "model": DEEPSEEK_MODEL,
+        "model": MODEL_NAME,
         "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user",   "content": prompt},
@@ -109,16 +106,17 @@ async def call_deepseek(prompt: str, deadline_ts: float) -> Tuple[bool, str, str
         "n": 1,
     }
 
-    endpoints = [
-        f"{DEEPSEEK_BASE.rstrip('/')}{DEEPSEEK_PATH}",
-        f"{DEEPSEEK_BASE.rstrip('/')}/chat/completions",  # auto-fallback if PATH was wrong
-    ]
-    attempt_no = 0
+    bases = [b for b in [OLLAMA_BASE.strip(), OLLAMA_ALT_BASE.strip()] if b]
+    if not bases:
+        return False, "", "http_404", 404
+
     last_status = 0
     last_reason = "error"
 
-    for ep in endpoints:
+    for base in bases:
+        ep = f"{base.rstrip('/')}{OLLAMA_PATH}"
         attempt_no = 0
+
         while True:
             attempt_no += 1
             remaining = max(0.1, deadline_ts - time.time())
@@ -127,91 +125,52 @@ async def call_deepseek(prompt: str, deadline_ts: float) -> Tuple[bool, str, str
                 status, parsed = await _attempt_post(ep, headers, body, this_attempt)
             except httpx.TimeoutException:
                 status, parsed = 0, None
-                last_reason = "timeout"
-            except Exception:
-                status, parsed = 0, None
-                last_reason = "net"
 
-            # Success path
+            # Success path (OpenAI-style schema)
             if status == 200 and parsed and isinstance(parsed, dict):
                 try:
-                    msg = (parsed.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                    msg = (
+                        parsed.get("choices", [{}])[0]
+                        .get("message", {})
+                        .get("content", "")
+                    )
                 except Exception:
                     msg = ""
+                if not isinstance(msg, str):
+                    return False, "", "parse", status
+                msg = msg.strip()
                 if not msg:
-                    return False, "", "empty", 200
+                    return False, "", "empty", status
                 return True, clamp_text(msg), "", 200
 
-            # Non-200: map reason
-            if status != 0:
-                last_status = status
-                last_reason = reason_from_status_and_body(status, parsed)
+            # Failure
+            last_status = status
+            last_reason = reason_from_status_and_body(status, parsed)
 
-            # Exit if not retryable or out of retries or out of time
-            retryable = (last_reason in {"timeout", "net"} or (status in RETRYABLE_STATUS))
+            # Retry?
+            retryable = (
+                last_reason in {"timeout", "net", "rate", "upstream"} or
+                (status in RETRYABLE_STATUS)
+            )
             if not retryable or attempt_no >= max(1, MAX_RETRIES) or time.time() >= deadline_ts:
                 break
 
-            # Backoff with jitter bounded by remaining time
             backoff = min(remaining, RETRY_BACKOFF_S * (2 ** (attempt_no - 1)) + random.uniform(0, 0.25))
             await asyncio.sleep(backoff)
 
-        # try next endpoint only on clear path issues
+        # If path is clearly wrong, try next base; otherwise stop.
         if last_status in (404, 405):
             continue
         break
 
     return False, "", last_reason, last_status
 
-async def call_openai(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, int]:
-    if not OPENAI_API_KEY:
-        return False, "", "missing_key", 0
-
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
-    body = {
-        "model": OPENAI_MODEL,
-        "messages": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": prompt},
-        ],
-        "temperature": TEMP,
-        "max_tokens": MAX_TOKENS,
-        "n": 1,
-    }
-
-    attempt_no = 0
-    while True:
-        attempt_no += 1
-        remaining = max(0.1, deadline_ts - time.time())
-        this_attempt = min(ATTEMPT_TIMEOUT_S, remaining)
-        try:
-            status, parsed = await _attempt_post("https://api.openai.com/v1/chat/completions", headers, body, this_attempt)
-        except httpx.TimeoutException:
-            status, parsed = 0, None
-
-        if status == 200 and parsed and isinstance(parsed, dict):
-            try:
-                msg = (parsed.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
-            except Exception:
-                msg = ""
-            if not msg:
-                return False, "", "empty", 200
-            return True, clamp_text(msg), "", 200
-
-        reason = reason_from_status_and_body(status, parsed)
-        retryable = (reason in {"timeout", "net"} or (status in RETRYABLE_STATUS))
-        if not retryable or attempt_no >= max(1, MAX_RETRIES) or time.time() >= deadline_ts:
-            return False, "", reason, status
-
-        backoff = min(remaining, RETRY_BACKOFF_S * (2 ** (attempt_no - 1)) + random.uniform(0, 0.25))
-        await asyncio.sleep(backoff)
-
 # ---------- FastAPI lifecycle ----------
 @app.on_event("startup")
 async def _startup():
     global _http
-    _http = httpx.AsyncClient()
-    log.info("startup: http client ready; deepseek_model=%s openai_model=%s", DEEPSEEK_MODEL, OPENAI_MODEL)
+    _http = httpx.AsyncClient()  # HTTP/1.1 to avoid http2 deps
+    log.info("startup: http client ready; model=%s base=%s", MODEL_NAME, OLLAMA_BASE)
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -224,7 +183,7 @@ async def _shutdown():
 # ---------- Endpoints ----------
 @app.api_route("/", methods=["GET","HEAD"])
 async def root():
-    return {"ok": True, "primary": "deepseek", "fallback_openai": bool(OPENAI_API_KEY), "model": DEEPSEEK_MODEL}
+    return {"ok": True, "provider": "ollama-free", "model": MODEL_NAME, "base": OLLAMA_BASE}
 
 @app.api_route("/healthz", methods=["GET","HEAD"])
 async def healthz():
@@ -234,8 +193,9 @@ async def healthz():
 async def diag():
     return {
         "ok": True,
-        "primary": {"provider": "deepseek", "base": DEEPSEEK_BASE, "path": DEEPSEEK_PATH, "model": DEEPSEEK_MODEL, "has_key": bool(DEEPSEEK_API_KEY)},
-        "fallback": {"provider": "openai", "model": OPENAI_MODEL, "has_key": bool(OPENAI_API_KEY)},
+        "provider": "ollama-free",
+        "model": MODEL_NAME,
+        "bases": [b for b in [OLLAMA_BASE, OLLAMA_ALT_BASE] if b],
         "timeouts": {"attempt_s": ATTEMPT_TIMEOUT_S, "req_budget_s": REQ_TIMEOUT_S, "max_retries": MAX_RETRIES},
     }
 
@@ -252,23 +212,15 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
     t0 = time.time()
     deadline = t0 + REQ_TIMEOUT_S
 
-    # Primary DeepSeek
-    ok, reply, reason, status = await call_deepseek(prompt, deadline)
+    ok, reply, reason, status = await call_ollama(prompt, deadline)
+    elapsed = time.time() - t0
+
     if ok:
-        log.info("[chat %s] ok deepseek in %.2fs", req_id, time.time() - t0)
+        log.info("[chat %s] ok in %.2fs", req_id, elapsed)
         return ChatOut(ok=True, reply=reply)
 
-    log.warning("[chat %s] deepseek non-ok reason=%s status=%s", req_id, reason, status)
-
-    # Optional fallback to OpenAI on quota/auth/endpoint issues
-    if OPENAI_API_KEY and reason in {"quota", "auth", "http_404", "http_405"}:
-        ok2, reply2, reason2, status2 = await call_openai(prompt, deadline)
-        if ok2:
-            log.info("[chat %s] ok openai fallback in %.2fs", req_id, time.time() - t0)
-            return ChatOut(ok=True, reply=reply2)
-        log.warning("[chat %s] openai fallback non-ok reason=%s status=%s", req_id, reason2, status2)
-
-    # Final error envelope
+    log.warning("[chat %s] non-ok reason=%s status=%s elapsed=%.2fs", req_id, reason, status, elapsed)
+    # Always 200 with error envelope (except auth/missing prompt)
     return ChatOut(ok=False, error=reason or "error")
 
 if __name__ == "__main__":
