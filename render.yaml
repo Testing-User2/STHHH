@@ -1,29 +1,22 @@
+# server/render.yaml
 services:
   - type: web
-    name: roblox-ai-bridge
+    name: roblox-chatnpc-ai
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
-    autoDeploy: true
-    healthCheckPath: /healthz
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false          # set in Render dashboard as Secret
-      - key: SHARED_SECRET
-        sync: false          # set in Render dashboard as Secret
+      - key: PROVIDER
+        value: groq
       - key: MODEL_NAME
-        value: gpt-4o-mini
-      - key: RPM
-        value: "2"
-      - key: TIMEOUT_SECS
-        value: "18"
+        value: llama3-8b-8192
+      - key: FAST_REPLY_SECS
+        value: "2.6"
+      - key: ATTEMPT_TIMEOUT_SECS
+        value: "2.2"
       - key: REQ_TIMEOUT_SECS
         value: "45"
-      - key: MIN_DELAY_SECS
-        value: "0"
-      - key: QUEUE_SIZE
-        value: "128"
       - key: HOST
         value: 0.0.0.0
-      # PORT is injected by Render automatically
+      # Add GROQ_API_KEY or OPENAI_API_KEY and SHARED_SECRET in the Render dashboard (not in git)
