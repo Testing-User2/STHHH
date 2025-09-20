@@ -7,12 +7,12 @@ from pydantic import BaseModel
 # ===== ENV =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-RPM            = int(os.getenv("RPM", "2"))                  # sustained requests/min
+RPM            = int(os.getenv("RPM", "2"))
 SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
-OPENAI_TIMEOUT = float(os.getenv("TIMEOUT_SECS", "18"))      # per OpenAI HTTP call
-REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "45"))  # end-to-end cap per request
-MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))     # optional floor latency
-QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "128"))         # server backlog
+OPENAI_TIMEOUT = float(os.getenv("TIMEOUT_SECS", "18"))
+REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "45"))
+MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))
+QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "128"))
 HOST           = os.getenv("HOST", "0.0.0.0")
 PORT           = int(os.getenv("PORT", "8000"))
 # =================
@@ -23,7 +23,7 @@ SYSTEM_PROMPT = (
     "No links or code unless the user insists repeatedly."
 )
 
-# ---- global pacing (uniform gap) ----
+# ---- pacing ----
 _gap = 60.0 / max(1, RPM)
 _last_call = 0.0
 _gate_lock = asyncio.Lock()
@@ -32,8 +32,7 @@ async def pace():
     async with _gate_lock:
         now = time.time()
         wait = _gap - (now - _last_call)
-        if wait > 0:
-            await asyncio.sleep(wait)
+        if wait > 0: await asyncio.sleep(wait)
         _last_call = time.time()
 
 # ---- models ----
@@ -45,7 +44,7 @@ class ChatOut(BaseModel):
     reply: Optional[str] = None
     error: Optional[str] = None
 
-# ---- OpenAI call with robust retry ----
+# ---- OpenAI call ----
 def _retry_after_secs(r: httpx.Response) -> Optional[float]:
     ra = r.headers.get("retry-after")
     if ra:
@@ -66,7 +65,6 @@ def _retry_after_secs(r: httpx.Response) -> Optional[float]:
 async def call_openai(prompt: str) -> Tuple[bool, str]:
     if not OPENAI_API_KEY:
         return False, "missing_key"
-
     headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
     body = {
         "model": MODEL_NAME,
@@ -78,7 +76,6 @@ async def call_openai(prompt: str) -> Tuple[bool, str]:
         "max_tokens": 320,
         "n": 1,
     }
-
     async with httpx.AsyncClient(timeout=OPENAI_TIMEOUT) as client:
         attempts = 0
         while attempts < 3:
@@ -86,45 +83,29 @@ async def call_openai(prompt: str) -> Tuple[bool, str]:
             r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
             if r.status_code == 200:
                 data = r.json()
-                msg = (
-                    data.get("choices", [{}])[0]
-                    .get("message", {})
-                    .get("content", "")
-                    .strip()
-                )
-                if not msg:
-                    return False, "empty"
-                if len(msg) > 380:
-                    msg = msg[:379] + "…"
+                msg = (data.get("choices", [{}])[0].get("message", {}).get("content", "") or "").strip()
+                if not msg: return False, "empty"
+                if len(msg) > 380: msg = msg[:379] + "…"
                 return True, msg
-
-            # explicit quota detection
             try:
-                data = r.json()
-                err_msg = str(data.get("error", {}).get("message", ""))
+                data = r.json(); err_msg = str(data.get("error", {}).get("message", ""))
                 if "insufficient_quota" in err_msg or "quota" in err_msg.lower():
                     return False, "quota"
-            except:
-                pass
-
-            # 429/5xx → backoff then retry
+            except: pass
             if r.status_code in (429, 500, 502, 503, 504):
                 ra = _retry_after_secs(r)
                 backoff = ra if ra is not None else min(2 + attempts * 3, 20)
                 await asyncio.sleep(backoff + random.random() * 0.3)
                 await pace()
                 continue
-
             return False, f"http_{r.status_code}"
-
         return False, "retry_exhausted"
 
-# ---- global queue (synchronous HTTP with internal worker) ----
+# ---- queue + worker ----
 class Job:
     __slots__ = ("prompt","fut")
     def __init__(self, prompt: str, fut: asyncio.Future):
-        self.prompt = prompt
-        self.fut = fut
+        self.prompt = prompt; self.fut = fut
 
 REQUEST_Q: asyncio.Queue[Job] = asyncio.Queue(maxsize=QUEUE_SIZE)
 
@@ -134,35 +115,29 @@ async def worker_loop():
         try:
             await pace()
             ok, r = await call_openai(job.prompt)
-            if ok:
-                job.fut.set_result(ChatOut(ok=True, reply=r))
+            if ok:   job.fut.set_result(ChatOut(ok=True, reply=r))
             else:
-                # normalize
-                if r == "quota":
-                    job.fut.set_result(ChatOut(ok=False, error="quota"))
-                elif r in ("missing_key","empty","retry_exhausted"):
-                    job.fut.set_result(ChatOut(ok=False, error=r))
-                elif r.startswith("http_"):
-                    job.fut.set_result(ChatOut(ok=False, error=r))
-                else:
-                    job.fut.set_result(ChatOut(ok=False, error="busy"))
+                if r == "quota": job.fut.set_result(ChatOut(ok=False, error="quota"))
+                elif r in ("missing_key","empty","retry_exhausted"): job.fut.set_result(ChatOut(ok=False, error=r))
+                elif r.startswith("http_"): job.fut.set_result(ChatOut(ok=False, error=r))
+                else: job.fut.set_result(ChatOut(ok=False, error="busy"))
         except Exception:
             job.fut.set_result(ChatOut(ok=False, error="exception"))
         finally:
             REQUEST_Q.task_done()
 
-# ---- FastAPI ----
 app = FastAPI()
 
 @app.on_event("startup")
 async def _startup():
     asyncio.create_task(worker_loop())
 
-@app.get("/")
+# Explicit GET + HEAD to satisfy Render health pings
+@app.api_route("/", methods=["GET","HEAD"])
 async def root():
     return {"ok": True, "msg": "root alive", "queue_depth": REQUEST_Q.qsize()}
 
-@app.get("/healthz")
+@app.api_route("/healthz", methods=["GET","HEAD"])
 async def healthz():
     return {"ok": True, "queue_depth": REQUEST_Q.qsize()}
 
@@ -170,29 +145,23 @@ async def healthz():
 async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
     if not SHARED_SECRET or x_shared_secret != SHARED_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
-
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="missing_prompt")
-
-    # refuse early if queue too deep for our deadline
     depth = REQUEST_Q.qsize()
     eta = depth * (60.0 / max(1, RPM)) + OPENAI_TIMEOUT + 2
     if eta > REQ_TIMEOUT:
         return ChatOut(ok=False, error="busy")
-
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     try:
         await asyncio.wait_for(REQUEST_Q.put(Job(prompt, fut)), timeout=0.5)
     except asyncio.TimeoutError:
         return ChatOut(ok=False, error="busy")
-
     t0 = time.time()
     try:
         result: ChatOut = await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
     except asyncio.TimeoutError:
         return ChatOut(ok=False, error="timeout")
-
     elapsed = time.time() - t0
     if result.ok and elapsed < MIN_DELAY_SECS:
         await asyncio.sleep(MIN_DELAY_SECS - elapsed)
