@@ -4,20 +4,20 @@ import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-# ========= ENV =========
+# ===== ENV =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-RPM            = int(os.getenv("RPM", "3"))               # sustained requests/min
+RPM            = int(os.getenv("RPM", "2"))                 # sustained requests/min
 SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
-TIMEOUT_SECS   = float(os.getenv("TIMEOUT_SECS", "12"))   # per HTTP call timeout
-MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))  # optional floor latency
+TIMEOUT_SECS   = float(os.getenv("TIMEOUT_SECS", "18"))     # per OpenAI HTTP call
+MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))
 
-MEM_TURNS      = int(os.getenv("MEMORY_TURNS", "8"))      # last N user/assistant pairs
-MEM_TTL_SECS   = int(os.getenv("MEMORY_TTL_SECS", "900")) # 15 min TTL
+MEM_TURNS      = int(os.getenv("MEMORY_TURNS", "8"))
+MEM_TTL_SECS   = int(os.getenv("MEMORY_TTL_SECS", "900"))
 
-QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "64"))       # server-side backlog
-REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "25")) # end-to-end cap
-# =======================
+QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "64"))
+REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "45"))  # end-to-end cap
+# =================
 
 SYSTEM_PROMPT = (
     "You are a concise conversational partner for a Roblox NPC. "
@@ -25,7 +25,7 @@ SYSTEM_PROMPT = (
     "No links or code unless the user insists repeatedly."
 )
 
-# ---- pacing (uniform gap) ----
+# pacing
 _gap = 60.0 / max(1, RPM)
 _last_call = 0.0
 _gate_lock = asyncio.Lock()
@@ -38,7 +38,7 @@ async def pace():
             await asyncio.sleep(wait)
         _last_call = time.time()
 
-# ---- memory store (in-process) ----
+# memory
 class ChatIn(BaseModel):
     prompt: str
     user_id: Optional[str] = None
@@ -55,7 +55,7 @@ def _key(inp: ChatIn) -> str:
     return (inp.user_id or inp.session or "anon").strip() or "anon"
 
 def _hist_get(k: str) -> List[Dict[str,str]]:
-    rec = MEMORY.get(k); 
+    rec = MEMORY.get(k)
     if not rec: return []
     return list(rec["msgs"])  # type: ignore
 
@@ -77,7 +77,7 @@ async def _prune_loop():
                 MEMORY.pop(k, None)
         await asyncio.sleep(60)
 
-# ---- OpenAI call with robust retry ----
+# OpenAI with retry
 def _retry_after_secs(r: httpx.Response) -> Optional[float]:
     ra = r.headers.get("retry-after")
     if ra:
@@ -89,7 +89,6 @@ def _retry_after_secs(r: httpx.Response) -> Optional[float]:
         j = r.json()
         if isinstance(j, dict):
             m = str(j.get("error",{}).get("message",""))
-            # crude parse like: "try again in 5s"
             import re
             z = re.search(r"(\d+)\s*s", m)
             if z: return float(z.group(1))
@@ -114,7 +113,6 @@ async def call_openai(messages: List[Dict[str,str]]) -> Tuple[bool, str]:
                 if not msg: return False, "empty"
                 return True, msg if len(msg) <= 380 else msg[:379]+"…"
 
-            # insufficient quota
             try:
                 data = r.json()
                 err_msg = str(data.get("error",{}).get("message",""))
@@ -122,7 +120,6 @@ async def call_openai(messages: List[Dict[str,str]]) -> Tuple[bool, str]:
                     return False, "quota"
             except: pass
 
-            # 429/5xx backoff
             if r.status_code in (429, 500, 502, 503, 504):
                 ra = _retry_after_secs(r)
                 backoff = ra if ra is not None else min(2 + attempts*3, 20)
@@ -134,7 +131,7 @@ async def call_openai(messages: List[Dict[str,str]]) -> Tuple[bool, str]:
 
         return False, "retry_exhausted"
 
-# ---- global request queue (single worker) ----
+# global queue
 class Job:
     __slots__ = ("messages","key","user_text","fut")
     def __init__(self, messages, key, user_text, fut):
@@ -155,7 +152,6 @@ async def worker_loop():
                 _hist_append(job.key, job.user_text, r)
                 job.fut.set_result(ChatOut(ok=True, reply=r))
             else:
-                # map errors to stable strings
                 if r == "quota":
                     job.fut.set_result(ChatOut(ok=False, error="quota"))
                 elif r in ("missing_key","empty","retry_exhausted"):
@@ -169,7 +165,7 @@ async def worker_loop():
         finally:
             REQUEST_Q.task_done()
 
-# ---- FastAPI ----
+# FastAPI
 app = FastAPI()
 
 @app.on_event("startup")
@@ -194,17 +190,21 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
     if not prompt:
         raise HTTPException(status_code=400, detail="missing_prompt")
 
-    key = _key(body)
+    key = (body.user_id or body.session or "anon").strip() or "anon"
     if body.reset:
         MEMORY.pop(key, None)
 
-    # build message list: system + history + new user
+    # Predict ETA; refuse if it will exceed REQ_TIMEOUT
+    depth = REQUEST_Q.qsize()
+    eta = depth * _gap + TIMEOUT_SECS + 2  # queue wait + call + slack
+    if eta > REQ_TIMEOUT:
+        return ChatOut(ok=False, error="busy")
+
     history = _hist_get(key)
     messages: List[Dict[str,str]] = [{"role":"system","content":SYSTEM_PROMPT}]
     messages.extend(history)
     messages.append({"role":"user","content":prompt})
 
-    # enqueue and wait bounded
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     try:
         await asyncio.wait_for(REQUEST_Q.put(Job(messages, key, prompt, fut)), timeout=0.5)
