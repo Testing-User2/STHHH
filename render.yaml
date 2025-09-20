@@ -1,21 +1,29 @@
 services:
   - type: web
-    name: roblox-ai-api
+    name: roblox-ai-bridge
     env: python
     plan: free
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "uvicorn app:app --host 0.0.0.0 --port $PORT"
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
+    healthCheckPath: /healthz
     envVars:
       - key: OPENAI_API_KEY
-        sync: false
+        sync: false          # set in Render dashboard as Secret
       - key: SHARED_SECRET
-        sync: false
+        sync: false          # set in Render dashboard as Secret
       - key: MODEL_NAME
         value: gpt-4o-mini
       - key: RPM
-        value: "3"
+        value: "2"
       - key: TIMEOUT_SECS
-        value: "12"
+        value: "18"
+      - key: REQ_TIMEOUT_SECS
+        value: "45"
       - key: MIN_DELAY_SECS
         value: "0"
+      - key: QUEUE_SIZE
+        value: "128"
+      - key: HOST
+        value: 0.0.0.0
+      # PORT is injected by Render automatically
