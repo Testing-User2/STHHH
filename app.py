@@ -1,3 +1,4 @@
+# app.py
 import os, time, asyncio, random
 from typing import Optional, Tuple
 import httpx
@@ -32,7 +33,8 @@ async def pace():
     async with _gate_lock:
         now = time.time()
         wait = _gap - (now - _last_call)
-        if wait > 0: await asyncio.sleep(wait)
+        if wait > 0:
+            await asyncio.sleep(wait)
         _last_call = time.time()
 
 # ---- models ----
@@ -115,7 +117,8 @@ async def worker_loop():
         try:
             await pace()
             ok, r = await call_openai(job.prompt)
-            if ok:   job.fut.set_result(ChatOut(ok=True, reply=r))
+            if ok:
+                job.fut.set_result(ChatOut(ok=True, reply=r))
             else:
                 if r == "quota": job.fut.set_result(ChatOut(ok=False, error="quota"))
                 elif r in ("missing_key","empty","retry_exhausted"): job.fut.set_result(ChatOut(ok=False, error=r))
@@ -132,7 +135,7 @@ app = FastAPI()
 async def _startup():
     asyncio.create_task(worker_loop())
 
-# Explicit GET + HEAD to satisfy Render health pings
+# Explicit GET + HEAD for Render pings
 @app.api_route("/", methods=["GET","HEAD"])
 async def root():
     return {"ok": True, "msg": "root alive", "queue_depth": REQUEST_Q.qsize()}
@@ -148,23 +151,37 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
     prompt = (body.prompt or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="missing_prompt")
+
     depth = REQUEST_Q.qsize()
     eta = depth * (60.0 / max(1, RPM)) + OPENAI_TIMEOUT + 2
     if eta > REQ_TIMEOUT:
-        return ChatOut(ok=False, error="busy")
+        result = ChatOut(ok=False, error="busy")
+        print(f"[chat] non-ok -> {result.error}", flush=True)
+        return result
+
     fut: asyncio.Future = asyncio.get_event_loop().create_future()
     try:
         await asyncio.wait_for(REQUEST_Q.put(Job(prompt, fut)), timeout=0.5)
     except asyncio.TimeoutError:
-        return ChatOut(ok=False, error="busy")
+        result = ChatOut(ok=False, error="busy")
+        print(f"[chat] non-ok -> {result.error}", flush=True)
+        return result
+
     t0 = time.time()
     try:
         result: ChatOut = await asyncio.wait_for(fut, timeout=REQ_TIMEOUT)
     except asyncio.TimeoutError:
-        return ChatOut(ok=False, error="timeout")
+        result = ChatOut(ok=False, error="timeout")
+        print(f"[chat] non-ok -> {result.error}", flush=True)
+        return result
+
     elapsed = time.time() - t0
     if result.ok and elapsed < MIN_DELAY_SECS:
         await asyncio.sleep(MIN_DELAY_SECS - elapsed)
+
+    if not result.ok:
+        print(f"[chat] non-ok -> {result.error}", flush=True)
+
     return result
 
 if __name__ == "__main__":
