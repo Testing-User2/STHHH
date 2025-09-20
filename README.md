@@ -1,32 +1,21 @@
-# Roblox → OllamaFreeAPI Bridge
+# Roblox ↔ LLM7 bridge
+SHARED_SECRET=your-shared-secret
 
-Minimal FastAPI server that proxies Roblox NPC prompts to **OllamaFreeAPI** (keyless, OpenAI-compatible `/chat/completions`).  
-Returns compact JSON for easy Roblox consumption.
+# LLM7 (OpenAI-compatible)
+LLM7_BASE=https://llm7.io/v1
+LLM7_API_KEY=unused         # or your token from https://token.llm7.io
 
-## Endpoints
-- `POST /v1/chat`  
-  Headers: `X-Shared-Secret: <secret>`  
-  Body: `{"prompt":"..."}`
-  - Success: `{"ok": true, "reply": "..."}`  
-  - Error:   `{"ok": false, "error": "<reason>"}`  
-- `GET /healthz` → `{"ok":true}`
-- `GET /diag` → config snapshot
+# Model + decoding
+MODEL_NAME=gpt-4
+TEMP=0.6
+MAX_TOKENS=160
 
-## Deploy on Render
-1. **Create Web Service** from this repo.
-2. **Environment Variables** (Render → Environment):
-   - `SHARED_SECRET` — secret string (must match Roblox `Config.EXTERNAL.SHARED_SECRET`)
-   - `OLLAMA_BASE=https://ollamafreeapi.onrender.com`
-   - Optional: `OLLAMA_ALT_BASE` (second mirror), `MODEL_NAME`, timeouts.
-3. **Build Command**: `pip install -r requirements.txt`  
-   **Start Command**: `uvicorn app:app --host 0.0.0.0 --port $PORT`
-4. Deploy and check logs.
+# Timeouts / retries
+ATTEMPT_TIMEOUT_SECS=8.0
+REQ_TIMEOUT_SECS=25
+MAX_RETRIES=2
+RETRY_BACKOFF_SECS=0.8
 
-## Roblox Config
-```lua
-EXTERNAL = {
-  URL = "https://<your-render>.onrender.com",
-  PATH = "/v1/chat",
-  SHARED_SECRET = "<same-as-Render>",
-  TIMEOUT_SECS = 45,
-}
+# Server bind
+HOST=0.0.0.0
+# PORT is provided by Render
