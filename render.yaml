@@ -1,25 +1,23 @@
 services:
   - type: web
-    name: roblox-ollama-bridge
+    name: roblox-llm7-bridge
     runtime: python
     plan: free
     envVars:
       - key: SHARED_SECRET
         sync: false
-      - key: OLLAMA_BASE
-        value: https://ollamafreeapi.onrender.com
-      - key: OLLAMA_ALT_BASE
-        value: ""              # optional second base
-      - key: OLLAMA_PATH
-        value: /chat/completions
+      - key: LLM7_BASE
+        value: https://llm7.io/v1
+      - key: LLM7_API_KEY
+        value: unused
       - key: MODEL_NAME
-        value: llama3-8b
+        value: gpt-4
       - key: TEMP
         value: "0.6"
       - key: MAX_TOKENS
         value: "160"
       - key: ATTEMPT_TIMEOUT_SECS
-        value: "6.0"
+        value: "8.0"
       - key: REQ_TIMEOUT_SECS
         value: "25"
       - key: MAX_RETRIES
