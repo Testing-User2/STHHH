@@ -1,4 +1,4 @@
-# app.py — Roblox → OllamaFreeAPI bridge (keyless). Robust, retries, correct path.
+# app.py — Roblox → LLM7.io bridge (OpenAI-compatible)
 # Contract:
 #   POST /v1/chat   Headers: X-Shared-Secret: <secret>
 #                   Body:    {"prompt":"..."}
@@ -12,27 +12,25 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 # ================= ENV =================
-SHARED_SECRET        = os.getenv("SHARED_SECRET", "")
+SHARED_SECRET   = os.getenv("SHARED_SECRET", "")
 
-# Public keyless gateway (OpenAI-compatible)
-OLLAMA_BASE          = os.getenv("OLLAMA_BASE", "https://ollamafreeapi.onrender.com")
-OLLAMA_ALT_BASE      = os.getenv("OLLAMA_ALT_BASE", "")  # optional mirror
-# Default to correct OpenAI-style path; code will auto-try fallbacks if 404/405.
-OLLAMA_PATH          = os.getenv("OLLAMA_PATH", "/v1/chat/completions")
+# LLM7 base + key: free/basic mode uses "unused"
+LLM7_BASE       = os.getenv("LLM7_BASE", "https://llm7.io/v1")  # accepts ".../v1" or root
+LLM7_API_KEY    = os.getenv("LLM7_API_KEY", "unused")
 
-MODEL_NAME           = os.getenv("MODEL_NAME", "llama3-8b")
-TEMP                 = float(os.getenv("TEMP", "0.6"))
-MAX_TOKENS           = int(os.getenv("MAX_TOKENS", "160"))
+MODEL_NAME      = os.getenv("MODEL_NAME", "gpt-4")
+TEMP            = float(os.getenv("TEMP", "0.6"))
+MAX_TOKENS      = int(os.getenv("MAX_TOKENS", "160"))
 
 # Timeouts / retries
-ATTEMPT_TIMEOUT_S    = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "8.0"))   # per HTTP attempt
-REQ_TIMEOUT_S        = float(os.getenv("REQ_TIMEOUT_SECS", "25"))        # total budget
-MAX_RETRIES          = int(os.getenv("MAX_RETRIES", "2"))                # per-endpoint attempts
-RETRY_BACKOFF_S      = float(os.getenv("RETRY_BACKOFF_SECS", "0.8"))     # base backoff
+ATTEMPT_TIMEOUT = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "8.0"))   # per HTTP attempt
+REQ_TIMEOUT     = float(os.getenv("REQ_TIMEOUT_SECS", "25"))        # total budget per request
+MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "2"))                # per-endpoint attempts
+BACKOFF_BASE    = float(os.getenv("RETRY_BACKOFF_SECS", "0.8"))     # base backoff
 
 # Server bind
-HOST                 = os.getenv("HOST", "0.0.0.0")
-PORT                 = int(os.getenv("PORT", "8000"))
+HOST            = os.getenv("HOST", "0.0.0.0")
+PORT            = int(os.getenv("PORT", "8000"))
 
 # =============== LOGGING ===============
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -57,7 +55,7 @@ SYSTEM_PROMPT = (
 
 RETRYABLE_STATUS = {408, 409, 425, 429, 500, 502, 503, 504}
 
-def clamp_text(s: str, n: int = 380) -> str:
+def clamp(s: str, n: int = 380) -> str:
     s = (s or "").strip()
     return s if len(s) <= n else s[: n - 1] + "…"
 
@@ -70,28 +68,13 @@ def reason_from_status(status: int) -> str:
     if status == 0: return "net"
     return f"http_{status}"
 
-def build_endpoints() -> List[str]:
-    bases = [b.strip() for b in [OLLAMA_BASE, OLLAMA_ALT_BASE] if b.strip()]
-    if not bases:
-        return []
-    # Preferred path + common alternates
-    paths = []
-    p = OLLAMA_PATH.strip()
-    if not p.startswith("/"):
-        p = "/" + p
-    paths.append(p)
-    # ensure we also try the canonical and legacy forms
-    if p != "/v1/chat/completions":
-        paths.append("/v1/chat/completions")
-    if p != "/chat/completions":
-        paths.append("/chat/completions")
-    # Combine
-    out = []
-    for b in bases:
-        base = b.rstrip("/")
-        for q in paths:
-            out.append(f"{base}{q}")
-    return out
+def _paths_for_base(base: str) -> List[str]:
+    base = base.rstrip("/")
+    # Prefer /chat/completions for bases that already end with /v1
+    if base.endswith("/v1"):
+        return [base + "/chat/completions", base + "/v1/chat/completions"]
+    # Otherwise try both canonical forms
+    return [base + "/v1/chat/completions", base + "/chat/completions"]
 
 async def _attempt_post(url: str, headers: dict, json: dict, timeout_s: float) -> Tuple[int, Optional[dict]]:
     assert _http is not None
@@ -103,12 +86,15 @@ async def _attempt_post(url: str, headers: dict, json: dict, timeout_s: float) -
         body = None
     return r.status_code, body
 
-async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, int]:
-    """
-    Returns: (ok, reply, reason, http_status)
-    reason ∈ {"timeout","net","rate","upstream","http_###","parse","empty"}
-    """
-    headers = {"Content-Type": "application/json"}  # keyless
+async def call_llm7(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, int]:
+    """Returns: (ok, reply, reason, http_status) with small error keys."""
+    if not LLM7_BASE:
+        return False, "", "http_404", 404
+
+    headers = {
+        "Authorization": f"Bearer {LLM7_API_KEY}",
+        "Content-Type": "application/json",
+    }
     body = {
         "model": MODEL_NAME,
         "messages": [
@@ -120,10 +106,7 @@ async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, 
         "n": 1,
     }
 
-    endpoints = build_endpoints()
-    if not endpoints:
-        return False, "", "http_404", 404
-
+    endpoints = _paths_for_base(LLM7_BASE)
     last_status = 0
     last_reason = "error"
 
@@ -132,7 +115,7 @@ async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, 
         while True:
             attempt_no += 1
             remaining = max(0.1, deadline_ts - time.time())
-            this_attempt = min(ATTEMPT_TIMEOUT_S, remaining)
+            this_attempt = min(ATTEMPT_TIMEOUT, remaining)
 
             try:
                 status, parsed = await _attempt_post(ep, headers, body, this_attempt)
@@ -153,7 +136,7 @@ async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, 
                 msg = msg.strip()
                 if not msg:
                     return False, "", "empty", status
-                return True, clamp_text(msg), "", 200
+                return True, clamp(msg), "", 200
 
             last_status = status
             last_reason = reason_from_status(status)
@@ -165,12 +148,11 @@ async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, 
             if not retryable or attempt_no >= max(1, MAX_RETRIES) or time.time() >= deadline_ts:
                 break
 
-            backoff = min(remaining, RETRY_BACKOFF_S * (2 ** (attempt_no - 1)) + random.uniform(0, 0.25))
+            backoff = min(remaining, BACKOFF_BASE * (2 ** (attempt_no - 1)) + random.uniform(0, 0.25))
             await asyncio.sleep(backoff)
 
-        # On 404/405 try next endpoint (likely wrong path/base)
         if last_status in (404, 405):
-            continue
+            continue  # try next candidate path
         break
 
     return False, "", last_reason, last_status
@@ -179,8 +161,8 @@ async def call_ollama(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, 
 @app.on_event("startup")
 async def _startup():
     global _http
-    _http = httpx.AsyncClient()  # HTTP/1.1 (no http2 dependency)
-    log.info("startup: http client ready; base=%s path=%s model=%s", OLLAMA_BASE, OLLAMA_PATH, MODEL_NAME)
+    _http = httpx.AsyncClient()  # HTTP/1.1 (no http2 deps)
+    log.info("startup: http client ready; base=%s model=%s", LLM7_BASE, MODEL_NAME)
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -193,7 +175,7 @@ async def _shutdown():
 # --------------- Endpoints ---------------
 @app.api_route("/", methods=["GET","HEAD"])
 async def root():
-    return {"ok": True, "provider": "ollama-free", "model": MODEL_NAME, "base": OLLAMA_BASE, "path": OLLAMA_PATH}
+    return {"ok": True, "provider": "llm7", "base": LLM7_BASE, "model": MODEL_NAME}
 
 @app.api_route("/healthz", methods=["GET","HEAD"])
 async def healthz():
@@ -203,11 +185,11 @@ async def healthz():
 async def diag():
     return {
         "ok": True,
-        "provider": "ollama-free",
+        "provider": "llm7",
+        "base": LLM7_BASE,
+        "paths_tried": _paths_for_base(LLM7_BASE),
         "model": MODEL_NAME,
-        "bases": [b for b in [OLLAMA_BASE, OLLAMA_ALT_BASE] if b],
-        "paths_tried": [p for p in {OLLAMA_PATH, "/v1/chat/completions", "/chat/completions"}],
-        "timeouts": {"attempt_s": ATTEMPT_TIMEOUT_S, "req_budget_s": REQ_TIMEOUT_S, "max_retries": MAX_RETRIES},
+        "timeouts": {"attempt_s": ATTEMPT_TIMEOUT, "req_budget_s": REQ_TIMEOUT, "max_retries": MAX_RETRIES},
     }
 
 @app.post("/v1/chat", response_model=ChatOut)
@@ -221,9 +203,9 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
 
     req_id = uuid.uuid4().hex[:8]
     t0 = time.time()
-    deadline = t0 + REQ_TIMEOUT_S
+    deadline = t0 + REQ_TIMEOUT
 
-    ok, reply, reason, status = await call_ollama(prompt, deadline)
+    ok, reply, reason, status = await call_llm7(prompt, deadline)
     elapsed = time.time() - t0
 
     if ok:
