@@ -5,12 +5,14 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError, APITimeoutError
 
-SHARED_SECRET        = os.getenv("SHARED_SECRET", "")  # [CHANGE]
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "") # [CHANGE]
-OPENAI_BASE_URL      = os.getenv("OPENAI_BASE_URL", "").strip() or None  # [CHANGE] only for Azure/proxy
+SHARED_SECRET  = (os.getenv("SHARED_SECRET", "") or "").strip()           # [CHANGE]
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()          # [CHANGE]
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "") or "").strip() or None  # [CHANGE if proxy/Azure]
+OPENAI_ORG_ID   = (os.getenv("OPENAI_ORG_ID", "") or "").strip()          # [CHANGE optional]
+OPENAI_PROJECT  = (os.getenv("OPENAI_PROJECT_ID", "") or "").strip()      # [CHANGE optional]
 
-MODEL_NAME           = os.getenv("MODEL_NAME", "gpt-4o-mini")  # [CHANGE]
-SYSTEM_PROMPT        = os.getenv("SYSTEM_PROMPT", "You are a concise Roblox NPC. Answer directly in 1–2 short sentences (9–22 words). No meta talk, no links, no code.")  # [CHANGE if needed]
+MODEL_NAME           = os.getenv("MODEL_NAME", "gpt-4o-mini")
+SYSTEM_PROMPT        = os.getenv("SYSTEM_PROMPT", "You are a concise Roblox NPC. Answer directly in 1–2 short sentences (9–22 words). No meta talk, no links, no code.")
 TEMP                 = float(os.getenv("TEMP", "0.6"))
 MAX_TOKENS           = int(os.getenv("MAX_TOKENS", "200"))
 ATTEMPT_TIMEOUT_SECS = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "8.0"))
@@ -22,7 +24,22 @@ PORT                 = int(os.getenv("PORT", "8000"))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("openai_bridge")
 
-client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL) if OPENAI_BASE_URL else AsyncOpenAI(api_key=OPENAI_API_KEY)
+def _validate_env() -> None:
+    if not SHARED_SECRET:
+        raise RuntimeError("SHARED_SECRET missing")
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY missing")
+    # Accept common OpenAI key formats; trim whitespace
+    if not (OPENAI_API_KEY.startswith("sk-") or OPENAI_API_KEY.startswith("rk-")):
+        log.warning("OPENAI_API_KEY format unexpected")
+_validate_env()
+
+client = AsyncOpenAI(
+    api_key=OPENAI_API_KEY,
+    base_url=OPENAI_BASE_URL,
+    organization=OPENAI_ORG_ID or None,
+    project=OPENAI_PROJECT or None,
+)
 
 class ChatIn(BaseModel):
     prompt: str = Field(min_length=1)
@@ -35,7 +52,7 @@ class ChatOut(BaseModel):
 def _clip(s: str, n: int) -> str:
     return s if len(s) <= n else s[:n]
 
-def reason_from_exc(e: Exception) -> str:
+def _reason_from_exc(e: Exception) -> str:
     if isinstance(e, RateLimitError):     return "rate"
     if isinstance(e, APITimeoutError):    return "timeout"
     if isinstance(e, APIConnectionError): return "network"
@@ -47,7 +64,7 @@ def reason_from_exc(e: Exception) -> str:
     if "timeout" in str(e).lower(): return "timeout"
     return "error"
 
-async def call_openai(prompt: str) -> Tuple[bool, str, str]:
+async def _openai_call(prompt: str) -> Tuple[bool, str, str]:
     deadline = time.time() + REQ_TIMEOUT_SECS
     attempt = 0
     while True:
@@ -58,7 +75,7 @@ async def call_openai(prompt: str) -> Tuple[bool, str, str]:
         attempt_timeout = min(ATTEMPT_TIMEOUT_SECS, max(0.1, remaining))
         try:
             resp = await client.chat.completions.create(
-                model=MODEL_NAME,
+                model=MODEL_NAME,  # [CHANGE]
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -72,7 +89,7 @@ async def call_openai(prompt: str) -> Tuple[bool, str, str]:
                 return False, "", "empty"
             return True, _clip(msg, 380), ""
         except Exception as e:
-            reason = reason_from_exc(e)
+            reason = _reason_from_exc(e)
             log.warning("[upstream openai attempt=%d] non-ok reason=%s", attempt, reason)
             if attempt >= (1 + MAX_RETRIES) or reason not in {"rate", "timeout", "network"}:
                 return False, "", reason
@@ -81,15 +98,49 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"ok": True, "provider": "openai", "model": MODEL_NAME, "base_url": OPENAI_BASE_URL or "https://api.openai.com/v1"}
+    masked = (OPENAI_API_KEY[:3] + "..." + OPENAI_API_KEY[-4:]) if OPENAI_API_KEY else ""
+    return {
+        "ok": True,
+        "provider": "openai",
+        "model": MODEL_NAME,
+        "base_url": OPENAI_BASE_URL or "https://api.openai.com/v1",
+        "org": bool(OPENAI_ORG_ID),
+        "project": bool(OPENAI_PROJECT),
+        "key_masked": masked,
+    }
 
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
 
+@app.get("/diag")
+async def diag(x_shared_secret: str = Header(default="")):
+    if x_shared_secret != SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return {
+        "ok": True,
+        "env": {
+            "has_secret": bool(SHARED_SECRET),
+            "has_api_key": bool(OPENAI_API_KEY),
+            "base_url": OPENAI_BASE_URL or "https://api.openai.com/v1",
+            "model": MODEL_NAME,
+            "org": bool(OPENAI_ORG_ID),
+            "project": bool(OPENAI_PROJECT),
+        }
+    }
+
+@app.post("/selftest", response_model=ChatOut)
+async def selftest(x_shared_secret: str = Header(default="")):
+    if x_shared_secret != SHARED_SECRET:
+        raise HTTPException(status_code=401, detail="unauthorized")
+    ok, reply, reason = await _openai_call("Say OK in one short sentence.")
+    if ok:
+        return ChatOut(ok=True, reply=reply)
+    return ChatOut(ok=False, error=reason or "error")
+
 @app.post("/v1/chat", response_model=ChatOut)
 async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
-    if not SHARED_SECRET or x_shared_secret != SHARED_SECRET:
+    if x_shared_secret != SHARED_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
     prompt = body.prompt.strip()
     if not prompt:
@@ -97,7 +148,7 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
 
     req_id = uuid.uuid4().hex[:8]
     t0 = time.time()
-    ok, reply, reason = await call_openai(prompt)
+    ok, reply, reason = await _openai_call(prompt)
     elapsed = time.time() - t0
 
     if ok:
