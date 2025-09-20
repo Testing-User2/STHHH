@@ -10,10 +10,10 @@ MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
 RPM            = int(os.getenv("RPM", "2"))                  # sustained requests/min
 SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
 OPENAI_TIMEOUT = float(os.getenv("TIMEOUT_SECS", "18"))      # per OpenAI HTTP call
-REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "45"))  # end-to-end cap per job
-MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))     # optional floor latency
+REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "45"))  # overall per question
+MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))
 QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "128"))
-MEM_TURNS      = int(os.getenv("MEMORY_TURNS", "8"))         # user/assistant pairs
+MEM_TURNS      = int(os.getenv("MEMORY_TURNS", "8"))
 MEM_TTL_SECS   = int(os.getenv("MEMORY_TTL_SECS", "900"))    # 15 min
 JOB_TTL_SECS   = int(os.getenv("JOB_TTL_SECS", "900"))       # 15 min
 # =================
@@ -24,7 +24,7 @@ SYSTEM_PROMPT = (
     "No links or code unless the user insists repeatedly."
 )
 
-# ---- Global pacing (uniform gap) ----
+# ---- Global pacing ----
 _gap = 60.0 / max(1, RPM)
 _last_call = 0.0
 _gate_lock = asyncio.Lock()
@@ -48,6 +48,8 @@ class AskOut(BaseModel):
     ok: bool
     job_id: Optional[str] = None
     eta: Optional[float] = None
+    ready: Optional[bool] = None
+    reply: Optional[str] = None
     error: Optional[str] = None
 
 class ResultOut(BaseModel):
@@ -56,8 +58,9 @@ class ResultOut(BaseModel):
     reply: Optional[str] = None
     error: Optional[str] = None
 
-# ---- Memory store (in-process) ----
+# ---- Memory store ----
 MEMORY: Dict[str, Dict[str, object]] = {}  # key -> {"msgs":[...], "t":ts}
+
 def _mem_key(user_id: Optional[str], session: Optional[str]) -> str:
     base = (user_id or session or "anon").strip() or "anon"
     return base
@@ -80,7 +83,7 @@ def _hist_append(k: str, user_text: str, assistant_text: str):
         del msgs[: len(msgs) - keep]
     rec["t"] = time.time()
 
-# ---- Job store (in-process) ----
+# ---- Jobs ----
 class JobRec(BaseModel):
     id: str
     created: float
@@ -93,7 +96,7 @@ class JobRec(BaseModel):
 JOBS: Dict[str, JobRec] = {}
 REQUEST_Q: asyncio.Queue[str] = asyncio.Queue(maxsize=QUEUE_SIZE)
 
-# ---- OpenAI call with robust retry ----
+# ---- OpenAI call with retry ----
 def _retry_after_secs(r: httpx.Response) -> Optional[float]:
     ra = r.headers.get("retry-after")
     if ra:
@@ -162,7 +165,6 @@ async def worker_loop():
             job.status = "running"  # type: ignore
             await pace()
 
-            # build messages from memory
             history = _hist_get(job.key)
             messages = [{"role": "system", "content": SYSTEM_PROMPT}, *history, {"role": "user", "content": job.prompt}]
 
@@ -173,11 +175,9 @@ async def worker_loop():
                 job.reply = r
                 job.status = "done"  # type: ignore
                 _hist_append(job.key, job.prompt, r)
-                # optional floor latency
                 if elapsed < MIN_DELAY_SECS:
-                    await asyncio.sleep(MIN_DELAY_SECS - elapsed)
+                    await asyncio.sleep(max(0.0, MIN_DELAY_SECS - elapsed))
             else:
-                # map to stable codes
                 if r == "quota":
                     job.error = "quota"; job.status = "error"  # type: ignore
                 elif r in ("missing_key", "empty", "retry_exhausted"):
@@ -191,7 +191,7 @@ async def worker_loop():
         finally:
             REQUEST_Q.task_done()
 
-# ---- GC for stale jobs and memory ----
+# ---- GC ----
 async def gc_loop():
     while True:
         now_ts = time.time()
@@ -223,7 +223,7 @@ async def healthz():
     return {"ok": True, "queue_depth": REQUEST_Q.qsize(), "jobs": len(JOBS)}
 
 @app.post("/v1/ask", response_model=AskOut)
-async def ask(body: AskIn, x_shared_secret: str = Header(default="")):
+async def ask(body: AskIn, x_shared_secret: str = Header(default=""), wait_secs: float = Query(default=0.0)):
     if not SHARED_SECRET or x_shared_secret != SHARED_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
 
@@ -235,7 +235,7 @@ async def ask(body: AskIn, x_shared_secret: str = Header(default="")):
     if body.reset:
         _hist_reset(key)
 
-    # estimate ETA and refuse if it will exceed cap
+    # ETA and early refuse if too deep
     depth = REQUEST_Q.qsize()
     eta = depth * _gap + OPENAI_TIMEOUT + 2
     if eta > REQ_TIMEOUT:
@@ -249,7 +249,19 @@ async def ask(body: AskIn, x_shared_secret: str = Header(default="")):
         JOBS.pop(jid, None)
         return AskOut(ok=False, error="busy")
 
-    return AskOut(ok=True, job_id=jid, eta=eta)
+    # Optional synchronous wait-in-ask
+    wait_cap = max(0.0, min(wait_secs, REQ_TIMEOUT))
+    if wait_cap > 0:
+        deadline = time.time() + wait_cap
+        while time.time() < deadline:
+            rec = JOBS[jid]
+            if rec.status == "done":
+                return AskOut(ok=True, job_id=jid, ready=True, reply=rec.reply)
+            if rec.status == "error":
+                return AskOut(ok=False, job_id=jid, ready=True, error=rec.error or "busy")
+            await asyncio.sleep(0.3)
+
+    return AskOut(ok=True, job_id=jid, eta=eta, ready=False)
 
 @app.get("/v1/result", response_model=ResultOut)
 async def result(job_id: str = Query(...), x_shared_secret: str = Header(default="")):
@@ -262,7 +274,6 @@ async def result(job_id: str = Query(...), x_shared_secret: str = Header(default
         return ResultOut(ok=True, ready=True, reply=rec.reply)
     if rec.status == "error":
         return ResultOut(ok=False, ready=True, error=rec.error or "busy")
-    # queued or running
     # guard against job-level timeout
     if time.time() - rec.created > REQ_TIMEOUT + 10:
         rec.status = "error"; rec.error = "timeout"  # type: ignore
