@@ -1,20 +1,31 @@
-# render.yaml
 services:
   - type: web
-    name: roblox-deepseek-bridge
+    name: roblox-ollama-bridge
     runtime: python
     plan: free
     envVars:
-      - key: DEEPSEEK_API_KEY
-        sync: false
-      - key: MODEL_NAME
-        value: deepseek-chat
       - key: SHARED_SECRET
         sync: false
+      - key: OLLAMA_BASE
+        value: https://ollamafreeapi.onrender.com
+      - key: OLLAMA_ALT_BASE
+        value: ""              # optional second base
+      - key: OLLAMA_PATH
+        value: /chat/completions
+      - key: MODEL_NAME
+        value: llama3-8b
+      - key: TEMP
+        value: "0.6"
+      - key: MAX_TOKENS
+        value: "160"
       - key: ATTEMPT_TIMEOUT_SECS
-        value: "4.0"
+        value: "6.0"
       - key: REQ_TIMEOUT_SECS
-        value: "30"
+        value: "25"
+      - key: MAX_RETRIES
+        value: "2"
+      - key: RETRY_BACKOFF_SECS
+        value: "0.8"
       - key: HOST
         value: 0.0.0.0
     buildCommand: pip install -r requirements.txt
