@@ -5,8 +5,8 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError, APITimeoutError
 
-SHARED_SECRET  = (os.getenv("SHARED_SECRET", "3JvH@9d!P4q#7LnX") or "").strip()           # [CHANGE]
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "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") or "").strip()          # [CHANGE]
+SHARED_SECRET  = (os.getenv("SHARED_SECRET", "") or "").strip()           # [CHANGE]
+OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()          # [CHANGE]
 OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "") or "").strip() or None  # [CHANGE if proxy/Azure]
 OPENAI_ORG_ID   = (os.getenv("OPENAI_ORG_ID", "") or "").strip()          # [CHANGE optional]
 OPENAI_PROJECT  = (os.getenv("OPENAI_PROJECT_ID", "") or "").strip()      # [CHANGE optional]
