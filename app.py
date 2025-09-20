@@ -9,13 +9,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
 SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
 # Hard wall per request; keep generous so OpenAI can sometimes win, we still reply at ~2s.
-REQ_TIMEOUT_SECS          = float(os.getenv("REQ_TIMEOUT_SECS", "120"))
+REQ_TIMEOUT_SECS          = float(os.getenv("REQ_TIMEOUT_SECS", "60"))
 # How long we give OpenAI before we fall back (must be < FAST_REPLY_SECS - 0.2)
-LLM_SOFT_DEADLINE_SECS    = float(os.getenv("LLM_SOFT_DEADLINE_SECS", "1.4"))
+LLM_SOFT_DEADLINE_SECS    = float(os.getenv("LLM_SOFT_DEADLINE_SECS", "2.5"))
 # Target user-visible latency (seconds) — your 2s requirement
-FAST_REPLY_SECS           = float(os.getenv("FAST_REPLY_SECS", "2.0"))
+FAST_REPLY_SECS           = float(os.getenv("FAST_REPLY_SECS", "3.0"))
 # Per-attempt HTTP timeout when calling OpenAI (cap per socket read)
-OPENAI_ATTEMPT_TIMEOUT_S  = float(os.getenv("OPENAI_ATTEMPT_TIMEOUT_SECS", "1.4"))
+OPENAI_ATTEMPT_TIMEOUT_S  = float(os.getenv("OPENAI_ATTEMPT_TIMEOUT_SECS", "2.5"))
 HOST                      = os.getenv("HOST", "0.0.0.0")
 PORT                      = int(os.getenv("PORT", "8000"))
 # ========================
