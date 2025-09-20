@@ -5,11 +5,11 @@ from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError, APITimeoutError
 
-SHARED_SECRET  = (os.getenv("SHARED_SECRET", "") or "").strip()           # [CHANGE]
-OPENAI_API_KEY = (os.getenv("OPENAI_API_KEY", "") or "").strip()          # [CHANGE]
-OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "") or "").strip() or None  # [CHANGE if proxy/Azure]
-OPENAI_ORG_ID   = (os.getenv("OPENAI_ORG_ID", "") or "").strip()          # [CHANGE optional]
-OPENAI_PROJECT  = (os.getenv("OPENAI_PROJECT_ID", "") or "").strip()      # [CHANGE optional]
+# [CHANGE] Set these in Render or .env (no quotes, no spaces)
+SHARED_SECRET   = (os.getenv("SHARED_SECRET", "") or "").strip()
+OPENAI_API_KEY  = (os.getenv("OPENAI_API_KEY", "") or "").strip()
+OPENAI_BASE_URL = (os.getenv("OPENAI_BASE_URL", "") or "").strip() or None   # leave empty unless Azure/proxy
+OPENAI_PROJECT  = (os.getenv("OPENAI_PROJECT_ID", "") or "").strip() or None # only if using Projects
 
 MODEL_NAME           = os.getenv("MODEL_NAME", "gpt-4o-mini")
 SYSTEM_PROMPT        = os.getenv("SYSTEM_PROMPT", "You are a concise Roblox NPC. Answer directly in 1–2 short sentences (9–22 words). No meta talk, no links, no code.")
@@ -29,17 +29,12 @@ def _validate_env() -> None:
         raise RuntimeError("SHARED_SECRET missing")
     if not OPENAI_API_KEY:
         raise RuntimeError("OPENAI_API_KEY missing")
-    # Accept common OpenAI key formats; trim whitespace
-    if not (OPENAI_API_KEY.startswith("sk-") or OPENAI_API_KEY.startswith("rk-")):
-        log.warning("OPENAI_API_KEY format unexpected")
+    # OpenAI keys usually start with sk-
+    if not OPENAI_API_KEY.startswith("sk-"):
+        raise RuntimeError("OPENAI_API_KEY format invalid or wrong secret pasted")
 _validate_env()
 
-client = AsyncOpenAI(
-    api_key=OPENAI_API_KEY,
-    base_url=OPENAI_BASE_URL,
-    organization=OPENAI_ORG_ID or None,
-    project=OPENAI_PROJECT or None,
-)
+client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, project=OPENAI_PROJECT)
 
 class ChatIn(BaseModel):
     prompt: str = Field(min_length=1)
@@ -75,7 +70,7 @@ async def _openai_call(prompt: str) -> Tuple[bool, str, str]:
         attempt_timeout = min(ATTEMPT_TIMEOUT_SECS, max(0.1, remaining))
         try:
             resp = await client.chat.completions.create(
-                model=MODEL_NAME,  # [CHANGE]
+                model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -98,15 +93,12 @@ app = FastAPI()
 
 @app.get("/")
 async def root():
-    masked = (OPENAI_API_KEY[:3] + "..." + OPENAI_API_KEY[-4:]) if OPENAI_API_KEY else ""
     return {
         "ok": True,
         "provider": "openai",
         "model": MODEL_NAME,
         "base_url": OPENAI_BASE_URL or "https://api.openai.com/v1",
-        "org": bool(OPENAI_ORG_ID),
         "project": bool(OPENAI_PROJECT),
-        "key_masked": masked,
     }
 
 @app.get("/healthz")
@@ -119,14 +111,12 @@ async def diag(x_shared_secret: str = Header(default="")):
         raise HTTPException(status_code=401, detail="unauthorized")
     return {
         "ok": True,
-        "env": {
-            "has_secret": bool(SHARED_SECRET),
-            "has_api_key": bool(OPENAI_API_KEY),
-            "base_url": OPENAI_BASE_URL or "https://api.openai.com/v1",
-            "model": MODEL_NAME,
-            "org": bool(OPENAI_ORG_ID),
-            "project": bool(OPENAI_PROJECT),
-        }
+        "has_api_key": bool(OPENAI_API_KEY),
+        "api_key_prefix": OPENAI_API_KEY[:6],
+        "api_key_suffix": OPENAI_API_KEY[-4:],
+        "base_url": OPENAI_BASE_URL or "https://api.openai.com/v1",
+        "model": MODEL_NAME,
+        "project": OPENAI_PROJECT or "",
     }
 
 @app.post("/selftest", response_model=ChatOut)
@@ -134,9 +124,7 @@ async def selftest(x_shared_secret: str = Header(default="")):
     if x_shared_secret != SHARED_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
     ok, reply, reason = await _openai_call("Say OK in one short sentence.")
-    if ok:
-        return ChatOut(ok=True, reply=reply)
-    return ChatOut(ok=False, error=reason or "error")
+    return ChatOut(ok=ok, reply=(reply if ok else None), error=(None if ok else reason or "error"))
 
 @app.post("/v1/chat", response_model=ChatOut)
 async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
