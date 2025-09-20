@@ -1,4 +1,4 @@
-# app.py — Roblox → LLM7.io bridge via OpenAI-compatible SDK
+# app.py — Roblox → LLM7.io bridge via OpenAI-compatible SDK (fixed exception imports)
 # Contract:
 #   POST /v1/chat with header X-Shared-Secret and body {"prompt":"..."}
 #   → 200 {"ok":true,"reply":"..."} or {"ok":false,"error":"<key>"}
@@ -8,8 +8,9 @@ import os, time, asyncio, logging, uuid, random
 from typing import Optional, Tuple
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
-from openai import AsyncOpenAI
-from openai._exceptions import APIStatusError, APIConnectionError, RateLimitError, Timeout
+
+# Use only PUBLIC exceptions from the OpenAI SDK — no _private modules.
+from openai import AsyncOpenAI, APIStatusError, APIConnectionError, RateLimitError, APITimeoutError
 
 # ===== ENV =====
 SHARED_SECRET   = os.getenv("SHARED_SECRET", "")
@@ -53,17 +54,23 @@ def clamp(s: str, n: int = 380) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 def reason_from_exc(exc: Exception) -> str:
-    if isinstance(exc, RateLimitError):         return "rate"
-    if isinstance(exc, Timeout):                return "timeout"
-    if isinstance(exc, APIConnectionError):     return "net"
+    # Order matters: more specific first.
+    if isinstance(exc, RateLimitError):     return "rate"
+    if isinstance(exc, APITimeoutError):    return "timeout"
+    if isinstance(exc, APIConnectionError): return "net"
     if isinstance(exc, APIStatusError):
-        sc = exc.status_code
+        sc = getattr(exc, "status_code", None)
         if sc == 401: return "auth"
         if sc == 404: return "http_404"
         if sc == 405: return "http_405"
         if sc == 429: return "rate"
         if sc in (500, 502, 503, 504): return "upstream"
-        return f"http_{sc}"
+        if isinstance(sc, int): return f"http_{sc}"
+        return "upstream"
+    # Generic timeout detection fallback
+    txt = str(exc).lower()
+    if "timeout" in txt or "timed out" in txt:
+        return "timeout"
     return "error"
 
 async def call_llm7(prompt: str, deadline_ts: float) -> Tuple[bool, str, str]:
@@ -77,8 +84,8 @@ async def call_llm7(prompt: str, deadline_ts: float) -> Tuple[bool, str, str]:
         if remaining <= 0.1:
             return False, "", "timeout"
 
-        # Per-attempt timeout at SDK level
         try:
+            # SDK-level per-attempt timeout
             resp = await _client.chat.completions.create(
                 model=MODEL_NAME,
                 messages=[
@@ -87,7 +94,7 @@ async def call_llm7(prompt: str, deadline_ts: float) -> Tuple[bool, str, str]:
                 ],
                 temperature=TEMP,
                 max_tokens=MAX_TOKENS,
-                timeout=ATTEMPT_TIMEOUT,  # SDK-level timeout
+                timeout=ATTEMPT_TIMEOUT,
             )
             msg = (resp.choices[0].message.content or "").strip()
             if not msg:
@@ -96,12 +103,10 @@ async def call_llm7(prompt: str, deadline_ts: float) -> Tuple[bool, str, str]:
         except Exception as exc:
             last_reason = reason_from_exc(exc)
 
-        # retry?
         retryable = last_reason in {"rate", "timeout", "net", "upstream"}
         if attempt >= max(1, MAX_RETRIES) or not retryable:
             return False, "", last_reason
 
-        # backoff within remaining budget
         backoff = min(remaining, BACKOFF_BASE * (2 ** (attempt - 1)) + random.uniform(0, 0.25))
         await asyncio.sleep(backoff)
 
@@ -114,7 +119,6 @@ async def _startup():
 
 @app.on_event("shutdown")
 async def _shutdown():
-    # AsyncOpenAI doesn't require explicit close; present for symmetry
     log.info("shutdown: done")
 
 # ===== ENDPOINTS =====
