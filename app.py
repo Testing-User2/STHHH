@@ -1,20 +1,17 @@
-import os
-import time
-import asyncio
+import os, time, asyncio
 from typing import Optional, Tuple
-
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
-# ========= ENV (configure on Render Dashboard or via render.yaml) =========
+# ---- ENV (set in Render) ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-RPM            = int(os.getenv("RPM", "3"))              # real per-minute limit
-SHARED_SECRET  = os.getenv("SHARED_SECRET", "")          # must match Roblox header
-TIMEOUT_SECS   = float(os.getenv("TIMEOUT_SECS", "12"))  # HTTP timeout
-MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0")) # floor latency if desired
-# ==========================================================================
+RPM            = int(os.getenv("RPM", "3"))
+SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
+TIMEOUT_SECS   = float(os.getenv("TIMEOUT_SECS", "12"))
+MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))
+# -----------------------------
 
 SYSTEM_PROMPT = (
     "You are a concise conversational partner for a Roblox NPC. "
@@ -22,7 +19,6 @@ SYSTEM_PROMPT = (
     "No links or code unless the user insists repeatedly."
 )
 
-# --- global pacing gate (uniform gap: 60/RPM) ---
 _gap = 60.0 / max(1, RPM)
 _last_call = 0.0
 _gate_lock = asyncio.Lock()
@@ -64,7 +60,6 @@ async def call_openai(prompt: str) -> Tuple[bool, str]:
     async with httpx.AsyncClient(timeout=TIMEOUT_SECS) as client:
         r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
         if r.status_code == 429:
-            # single paced retry
             await pace()
             r = await client.post("https://api.openai.com/v1/chat/completions", headers=headers, json=body)
         if r.status_code != 200:
@@ -84,6 +79,10 @@ async def call_openai(prompt: str) -> Tuple[bool, str]:
 
 app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"ok": True, "msg": "root alive"}
+
 @app.get("/healthz")
 async def healthz():
     return {"ok": True}
@@ -98,11 +97,11 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
     t0 = time.time()
     await pace()
     ok, reply = await call_openai(prompt)
-    if ok and (time.time() - t0) < MIN_DELAY_SECS:
-        await asyncio.sleep(MIN_DELAY_SECS - (time.time() - t0))
+    elapsed = time.time() - t0
+    if ok and elapsed < MIN_DELAY_SECS:
+        await asyncio.sleep(MIN_DELAY_SECS - elapsed)
     return ChatOut(ok=ok, reply=reply if ok else None, error=None if ok else reply)
 
-# Local run (Render uses start command from render.yaml)
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("app:app", host=os.getenv("HOST", "0.0.0.0"), port=int(os.getenv("PORT", "8000")), reload=False)
