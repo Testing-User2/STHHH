@@ -1,23 +1,20 @@
-# app.py — provider-switchable, tuned for 2–3 s real answers (Groq default)
-import os, time, asyncio, re
+# app.py — Real-model answers only. No fallbacks. Groq/OpenAI switchable.
+import os, time, asyncio
 from typing import Optional, Tuple
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
 # ===== ENV =====
-PROVIDER      = os.getenv("PROVIDER", "groq")          # groq | openai
-GROQ_API_KEY  = os.getenv("GROQ_API_KEY", "")
-OPENAI_API_KEY= os.getenv("OPENAI_API_KEY", "")
-MODEL_NAME    = os.getenv("MODEL_NAME", "llama3-8b-8192")  # groq: llama3-8b-8192 ; openai: gpt-4o-mini
-SHARED_SECRET = os.getenv("SHARED_SECRET", "")
-
-# Timing tuned for ~2–3 s total
-FAST_REPLY_SECS            = float(os.getenv("FAST_REPLY_SECS", "2.6"))   # user-visible delay cap
-LLM_SOFT_DEADLINE_SECS     = float(os.getenv("LLM_SOFT_DEADLINE_SECS", "2.2"))
-ATTEMPT_TIMEOUT_SECS       = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "2.2"))
-REQ_TIMEOUT_SECS           = float(os.getenv("REQ_TIMEOUT_SECS", "45"))
-HOST = os.getenv("HOST", "0.0.0.0"); PORT = int(os.getenv("PORT", "8000"))
+PROVIDER       = os.getenv("PROVIDER", "groq").lower()   # "groq" | "openai"
+GROQ_API_KEY   = os.getenv("GROQ_API_KEY", "")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+MODEL_NAME     = os.getenv("MODEL_NAME", "llama3-8b-8192")  # groq default
+SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
+ATTEMPT_TIMEOUT_SECS = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "3.0"))  # per HTTP attempt
+REQ_TIMEOUT_SECS     = float(os.getenv("REQ_TIMEOUT_SECS", "30"))       # end-to-end cap
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
 # =================
 
 SYSTEM_PROMPT = (
@@ -34,13 +31,15 @@ class ChatOut(BaseModel):
     error: Optional[str] = None
 
 def _base_url_and_key():
-    if PROVIDER.lower() == "groq":
+    if PROVIDER == "groq":
         return "https://api.groq.com/openai/v1", GROQ_API_KEY
-    return "https://api.openai.com/v1", OPENAI_API_KEY
+    elif PROVIDER == "openai":
+        return "https://api.openai.com/v1", OPENAI_API_KEY
+    return "", ""
 
-async def call_model(prompt: str) -> Tuple[bool, str, str]:
+async def call_provider(prompt: str) -> Tuple[bool, str, str]:
     base, key = _base_url_and_key()
-    if not key:
+    if not base or not key:
         return False, "", "missing_key"
 
     headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
@@ -55,15 +54,20 @@ async def call_model(prompt: str) -> Tuple[bool, str, str]:
         "n": 1,
     }
 
-    timeout = httpx.Timeout(connect=min(5.0, ATTEMPT_TIMEOUT_SECS),
-                            read=ATTEMPT_TIMEOUT_SECS, write=5.0, pool=5.0)
-    try:
-        async with httpx.AsyncClient(timeout=timeout) as client:
+    timeout = httpx.Timeout(
+        connect=min(5.0, ATTEMPT_TIMEOUT_SECS),
+        read=ATTEMPT_TIMEOUT_SECS,
+        write=5.0,
+        pool=5.0,
+    )
+
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        try:
             r = await client.post(f"{base}/chat/completions", headers=headers, json=body)
-    except httpx.TimeoutException:
-        return False, "", "timeout"
-    except Exception:
-        return False, "", "net"
+        except httpx.TimeoutException:
+            return False, "", "timeout"
+        except Exception:
+            return False, "", "net"
 
     if r.status_code == 200:
         try:
@@ -73,13 +77,17 @@ async def call_model(prompt: str) -> Tuple[bool, str, str]:
             return False, "", "parse"
         if not msg:
             return False, "", "empty"
-        if len(msg) > 380: msg = msg[:379] + "…"
+        if len(msg) > 380:
+            msg = msg[:379] + "…"
         return True, msg, ""
-    # map explicit quota/auth
+    # map common errors
     try:
-        data = r.json(); err = str(data.get("error", {}).get("message", ""))
-        if "insufficient_quota" in err.lower(): return False, "", "quota"
-        if r.status_code == 401: return False, "", "auth"
+        data = r.json()
+        err_msg = str(data.get("error", {}).get("message", ""))
+        if "insufficient_quota" in err_msg.lower():
+            return False, "", "quota"
+        if r.status_code == 401:
+            return False, "", "auth"
     except Exception:
         pass
     return False, "", f"http_{r.status_code}"
@@ -88,11 +96,24 @@ app = FastAPI()
 
 @app.api_route("/", methods=["GET","HEAD"])
 async def root():
+    # No secrets, just to verify provider/model at runtime.
     return {"ok": True, "provider": PROVIDER, "model": MODEL_NAME}
 
 @app.api_route("/healthz", methods=["GET","HEAD"])
 async def healthz():
     return {"ok": True}
+
+@app.api_route("/diag", methods=["GET"])
+async def diag():
+    # Helps confirm Render is configured to hit the intended provider; no key values are exposed.
+    base, key = _base_url_and_key()
+    return {
+        "ok": True,
+        "provider": PROVIDER,
+        "model": MODEL_NAME,
+        "has_key": bool(key),
+        "base": base,
+    }
 
 @app.post("/v1/chat", response_model=ChatOut)
 async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
@@ -104,23 +125,18 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
         raise HTTPException(status_code=400, detail="missing_prompt")
 
     t0 = time.time()
-    deadline = t0 + min(REQ_TIMEOUT_SECS, 60)
+    deadline = t0 + REQ_TIMEOUT_SECS
 
-    # One fast attempt: target real answer within ~2.2 s
-    ok, text, reason = await call_model(prompt)
+    # Single real attempt; return only model text or a concrete error
+    ok, text, reason = await call_provider(prompt)
+    if ok:
+        return ChatOut(ok=True, reply=text)
 
-    # If model missed the soft window, do NOT emit templated fallback; hold consistent latency and return concise neutral line.
-    if not ok:
-        # minimal neutral fallback; no echo
-        text = "Kurz und direkt: Antwort kommt knapp. Frag weiter, ich bleibe dran." if re.search(r"[äöüÄÖÜß]", prompt) \
-               else "Direct and brief: quick take pending; keep going, I’m on it."
+    # Log compactly for inspection on Render
+    print(f"[chat] provider={PROVIDER} non-ok -> {reason}", flush=True)
 
-    # Shape to fixed ~2.6 s total for consistent feel
-    elapsed = time.time() - t0
-    wait = max(0.0, FAST_REPLY_SECS - elapsed)
-    if wait > 0: await asyncio.sleep(wait)
-
-    return ChatOut(ok=True, reply=text)
+    # Return error → Roblox shows short German error mapped in ChatAIService
+    return ChatOut(ok=False, error=reason or "error")
 
 if __name__ == "__main__":
     import uvicorn
