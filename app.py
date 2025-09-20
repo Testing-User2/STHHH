@@ -210,7 +210,7 @@ async def call_openai(prompt: str, deadline_ts: float) -> Tuple[bool, str, str, 
 @app.on_event("startup")
 async def _startup():
     global _http
-    _http = httpx.AsyncClient(http2=True)
+    _http = httpx.AsyncClient()
     log.info("startup: http client ready; deepseek_model=%s openai_model=%s", DEEPSEEK_MODEL, OPENAI_MODEL)
 
 @app.on_event("shutdown")
