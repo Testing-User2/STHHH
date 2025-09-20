@@ -27,7 +27,7 @@ MAX_RETRIES     = int(os.getenv("MAX_RETRIES", "2"))
 BACKOFF_BASE    = float(os.getenv("RETRY_BACKOFF_SECS", "0.8"))
 
 # Force completions path if upstream rejects chat
-COMPAT_FORCE_COMPLETIONS = os.getenv("COMPAT_FORCE_COMPLETIONS", "false").lower() in {"1","true","yes"}
+COMPAT_FORCE_COMPLETIONS = os.getenv("COMPAT_FORCE_COMPLETIONS", "true").lower() in {"1","true","yes"}
 
 HOST            = os.getenv("HOST", "0.0.0.0")
 PORT            = int(os.getenv("PORT", "8000"))
