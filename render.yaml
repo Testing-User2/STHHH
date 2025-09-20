@@ -19,22 +19,3 @@ services:
         value: "12"
       - key: MIN_DELAY_SECS
         value: "0"
-# Optional worker for Discord bot. Comment out if not needed.
-#  - type: worker
-#    name: discord-bot
-#    env: python
-#    plan: free
-#    buildCommand: "pip install -r requirements.txt"
-#    startCommand: "python bot.py"
-#    autoDeploy: true
-#    envVars:
-#      - key: OPENAI_API_KEY
-#        sync: false
-#      - key: DISCORD_TOKEN
-#        sync: false
-#      - key: MODEL_NAME
-#        value: gpt-4o-mini
-#      - key: RPM
-#        value: "3"
-#      - key: TIMEOUT_SECS
-#        value: "12"
