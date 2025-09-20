@@ -1,20 +1,16 @@
 # app.py
-
 import os, time, uuid, logging
 from typing import Optional, Tuple
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel, Field
 from openai import AsyncOpenAI, RateLimitError, APIStatusError, APIConnectionError, APITimeoutError
 
-# [CHANGE] set non-empty in production
-SHARED_SECRET        = os.getenv("SHARED_SECRET", "")
-# [CHANGE] required
-OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "")
-# optional (e.g., Azure OpenAI base URL)
-OPENAI_BASE_URL      = os.getenv("OPENAI_BASE_URL", "").strip() or None
+SHARED_SECRET        = os.getenv("SHARED_SECRET", "")  # [CHANGE]
+OPENAI_API_KEY       = os.getenv("OPENAI_API_KEY", "") # [CHANGE]
+OPENAI_BASE_URL      = os.getenv("OPENAI_BASE_URL", "").strip() or None  # [CHANGE] only for Azure/proxy
 
-MODEL_NAME           = os.getenv("MODEL_NAME", "gpt-4o-mini")
-SYSTEM_PROMPT        = os.getenv("SYSTEM_PROMPT", "You are a concise Roblox NPC. Answer directly in 1–2 short sentences (9–22 words). No meta talk, no links, no code.")
+MODEL_NAME           = os.getenv("MODEL_NAME", "gpt-4o-mini")  # [CHANGE]
+SYSTEM_PROMPT        = os.getenv("SYSTEM_PROMPT", "You are a concise Roblox NPC. Answer directly in 1–2 short sentences (9–22 words). No meta talk, no links, no code.")  # [CHANGE if needed]
 TEMP                 = float(os.getenv("TEMP", "0.6"))
 MAX_TOKENS           = int(os.getenv("MAX_TOKENS", "200"))
 ATTEMPT_TIMEOUT_SECS = float(os.getenv("ATTEMPT_TIMEOUT_SECS", "8.0"))
@@ -62,7 +58,7 @@ async def call_openai(prompt: str) -> Tuple[bool, str, str]:
         attempt_timeout = min(ATTEMPT_TIMEOUT_SECS, max(0.1, remaining))
         try:
             resp = await client.chat.completions.create(
-                model=MODEL_NAME,  # [CHANGE] set your model
+                model=MODEL_NAME,
                 messages=[
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": prompt},
@@ -93,7 +89,7 @@ async def healthz():
 
 @app.post("/v1/chat", response_model=ChatOut)
 async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
-    if not SHARED_SECRET or x_shared_secret != SHARED_SECRET:  # [CHANGE] set SHARED_SECRET
+    if not SHARED_SECRET or x_shared_secret != SHARED_SECRET:
         raise HTTPException(status_code=401, detail="unauthorized")
     prompt = body.prompt.strip()
     if not prompt:
