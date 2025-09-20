@@ -1,17 +1,34 @@
-# Roblox AI API (Render-ready)
+# Roblox AI Bridge (stateless, paced)
 
-FastAPI service for Roblox NPC chat. Uniform pacing to avoid rate limits. Optional Discord worker.
+Single-endpoint FastAPI service that calls OpenAI with strict pacing and retries. Designed for Roblox NPCs: one prompt in → one reply out. No memory. Includes robust 429/5xx handling and a small server-side queue to smooth spikes.
 
-## Deploy on Render
+## Endpoints
 
-1. **Fork this repo** to your GitHub.
-2. In Render, **New → Web Service → Build from GitHub**. Pick this repo.
-3. Render detects `render.yaml`. Confirm.
-4. In the **Environment** tab of the `roblox-ai-api` service, set:
-   - `OPENAI_API_KEY` = your key
-   - `SHARED_SECRET`  = a strong random string (both sides must match)
-   - Adjust `RPM`, `TIMEOUT_SECS`, `MIN_DELAY_SECS` as needed
-5. Deploy. After it’s live, note the URL, e.g. `https://roblox-ai-api.onrender.com`.
+- `POST /v1/chat`  
+  Body: `{"prompt": "text"}`  
+  Headers: `X-Shared-Secret: <your secret>`  
+  Response: `{"ok": true, "reply": "..."}` or `{"ok": false, "error": "busy|timeout|quota|http_###"}`
 
-**Allowed HTTP Domains (Roblox Studio)**  
-Game Settings → Security → Allowed HTTP Domains → add your Render domain:
+- `GET /healthz` – health check
+
+## Environment Variables
+
+See `.env.example`. On Render, set these in the Environment tab (or use `render.yaml`). Required:
+- `OPENAI_API_KEY`
+- `SHARED_SECRET`
+
+Recommended:
+- `MODEL_NAME=gpt-4o-mini`
+- `RPM=2`
+- `TIMEOUT_SECS=18`
+- `REQ_TIMEOUT_SECS=45`
+- `QUEUE_SIZE=128`
+
+## Local Run
+
+```bash
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env  # fill values
+export $(grep -v '^#' .env | xargs)  # or use a dotenv tool
+uvicorn app:app --host 0.0.0.0 --port 8000
