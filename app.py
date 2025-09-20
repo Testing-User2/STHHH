@@ -1,5 +1,5 @@
 import os, time, asyncio, random
-from typing import Optional, Tuple, Dict, List
+from typing import Optional, Tuple
 import httpx
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
@@ -13,6 +13,8 @@ OPENAI_TIMEOUT = float(os.getenv("TIMEOUT_SECS", "18"))      # per OpenAI HTTP c
 REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "45"))  # end-to-end cap per request
 MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))     # optional floor latency
 QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "128"))         # server backlog
+HOST           = os.getenv("HOST", "0.0.0.0")
+PORT           = int(os.getenv("PORT", "8000"))
 # =================
 
 SYSTEM_PROMPT = (
@@ -175,7 +177,7 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
 
     # refuse early if queue too deep for our deadline
     depth = REQUEST_Q.qsize()
-    eta = depth * _gap + OPENAI_TIMEOUT + 2
+    eta = depth * (60.0 / max(1, RPM)) + OPENAI_TIMEOUT + 2
     if eta > REQ_TIMEOUT:
         return ChatOut(ok=False, error="busy")
 
@@ -198,4 +200,4 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host=os.getenv("HOST","0.0.0.0"), port=int(os.getenv("PORT","8000")), reload=False)
+    uvicorn.run("app:app", host=HOST, port=PORT, reload=False)
