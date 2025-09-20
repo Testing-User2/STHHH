@@ -8,10 +8,10 @@ from pydantic import BaseModel
 # ===== ENV =====
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 MODEL_NAME     = os.getenv("MODEL_NAME", "gpt-4o-mini")
-RPM            = int(os.getenv("RPM", "3"))                  # ↑ from 2 → 3 to shrink gate
+RPM            = int(os.getenv("RPM", "3"))                  # sustained requests/min
 SHARED_SECRET  = os.getenv("SHARED_SECRET", "")
-OPENAI_TIMEOUT = float(os.getenv("TIMEOUT_SECS", "18"))
-REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "90"))  # ↑ so gate+call fits
+OPENAI_TIMEOUT = float(os.getenv("TIMEOUT_SECS", "18"))      # per OpenAI request
+REQ_TIMEOUT    = float(os.getenv("REQ_TIMEOUT_SECS", "120")) # end-to-end cap
 MIN_DELAY_SECS = float(os.getenv("MIN_DELAY_SECS", "0"))
 QUEUE_SIZE     = int(os.getenv("QUEUE_SIZE", "128"))
 HOST           = os.getenv("HOST", "0.0.0.0")
@@ -24,13 +24,12 @@ SYSTEM_PROMPT = (
     "No links or code unless the user insists repeatedly."
 )
 
-# ---- pacing ----
+# ---- pacing (uniform gap) ----
 _gap = 60.0 / max(1, RPM)
 _last_call = 0.0
 _gate_lock = asyncio.Lock()
 
 def current_gate_wait() -> float:
-    # Remaining time until we may issue the next upstream call
     return max(0.0, _gap - (time.time() - _last_call))
 
 async def pace():
@@ -42,13 +41,7 @@ async def pace():
         _last_call = time.time()
 
 def expected_eta(depth: int) -> float:
-    """
-    Time budget to complete a newly enqueued job:
-    - wait for jobs ahead: depth * gap
-    - wait for current gate window: current_gate_wait()
-    - plus the upstream call time
-    - plus small overhead
-    """
+    # Wait for N jobs ahead + current gate + upstream call + small overhead
     return depth * _gap + current_gate_wait() + OPENAI_TIMEOUT + 2.0
 
 # ---- models ----
@@ -149,7 +142,6 @@ app = FastAPI()
 async def _startup():
     asyncio.create_task(worker_loop())
 
-# GET + HEAD for Render pings
 @app.api_route("/", methods=["GET","HEAD"])
 async def root():
     return {"ok": True, "msg": "root alive", "queue_depth": REQUEST_Q.qsize()}
@@ -168,7 +160,6 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
 
     depth = REQUEST_Q.qsize()
     eta = expected_eta(depth)
-
     if eta > REQ_TIMEOUT:
         result = ChatOut(ok=False, error="busy")
         print(f"[chat] non-ok -> {result.error} (eta={eta:.1f}s, depth={depth}, gap={_gap:.1f}s)", flush=True)
@@ -182,17 +173,12 @@ async def chat(body: ChatIn, x_shared_secret: str = Header(default="")):
         print(f"[chat] non-ok -> {result.error} (enqueue timeout)", flush=True)
         return result
 
-    # Wait exactly as long as our ETA permits (+guard)
     try:
         result: ChatOut = await asyncio.wait_for(fut, timeout=eta + 2.0)
     except asyncio.TimeoutError:
         result = ChatOut(ok=False, error="timeout")
         print(f"[chat] non-ok -> {result.error} (eta={eta:.1f}s exceeded)", flush=True)
         return result
-
-    if result.ok and MIN_DELAY_SECS > 0:
-        # Optional smoothing; not usually needed
-        pass
 
     if not result.ok:
         print(f"[chat] non-ok -> {result.error}", flush=True)
